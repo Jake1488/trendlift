@@ -1,40 +1,96 @@
-require('dotenv').config();
 const express = require('express');
-const mongoose = require('mongoose');
+const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
 
-// Инициализация приложения
 const app = express();
 app.use(express.json());
 app.use(cors());
 
-// Подключение к MongoDB (использует переменную из Railway)
-const mongoUrl = process.env.MONGO_URL || 'mongodb+srv://user:pass@cluster.mongodb.net/dbname?retryWrites=true&w=majority';
-mongoose.connect(mongoUrl, { 
-  useNewUrlParser: true, 
-  useUnifiedTopology: true 
-})
-.then(() => console.log('✅ MongoDB connected'))
-.catch(err => console.log('❌ MongoDB error:', err.message));
+// Подключение к PostgreSQL (Render создаст DATABASE_URL автоматически)
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
 
-// Модель пользователя
-const User = mongoose.model('User', new mongoose.Schema({
-  username: { type: String, required: true, unique: true },
-  loginPassword: { type: String, required: true },
-  withdrawPassword: { type: String, required: true },
-  createdAt: { type: Date, default: Date.now }
-}));
+// Создаем таблицу пользователей (выполнится при старте)
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      username VARCHAR(50) UNIQUE NOT NULL,
+      login_password VARCHAR(100) NOT NULL,
+      withdraw_password VARCHAR(100) NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+}
 
-// Middleware для проверки токена
-const authenticate = (req, res, next) => {
-  const token = req.headers.authorization?.split(' ')[1];
-  if (!token) return res.status(401).json({ error: 'No token provided' });
-
+// Регистрация
+app.post('/api/register', async (req, res) => {
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback_secret');
-    req.user = decoded;
+    const { username, loginPassword, withdrawPassword } = req.body;
+
+    // Проверка данных
+    if (!username || !loginPassword || !withdrawPassword) {
+      return res.status(400).json({ error: 'Все поля обязательны' });
+    }
+
+    // Шифруем пароли
+    const hashedLoginPassword = await bcrypt.hash(loginPassword, 10);
+    const hashedWithdrawPassword = await bcrypt.hash(withdrawPassword, 10);
+
+    // Сохраняем в БД
+    await pool.query(
+      'INSERT INTO users (username, login_password, withdraw_password) VALUES ($1, $2, $3)',
+      [username, hashedLoginPassword, hashedWithdrawPassword]
+    );
+
+    res.status(201).json({ message: 'Пользователь создан!' });
+
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(400).json({ error: 'Имя пользователя занято' });
+    }
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Вход
+app.post('/api/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+
+    // Ищем пользователя
+    const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+    const user = result.rows[0];
+
+    if (!user || !(await bcrypt.compare(password, user.login_password))) {
+      return res.status(401).json({ error: 'Неверные данные' });
+    }
+
+    // Генерируем токен
+    const token = jwt.sign(
+      { username },
+      process.env.JWT_SECRET || 'secret_fallback',
+      { expiresIn: '1h' }
+    );
+
+    res.json({ token });
+
+  } catch (err) {
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Инициализация и запуск
+initDB().then(() => {
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => {
+    console.log(`Сервер запущен на порту ${PORT}`);
+  });
+});    req.user = decoded;
     next();
   } catch (err) {
     res.status(403).json({ error: 'Invalid token' });
